@@ -1,0 +1,14 @@
+{
+  "geode": "4.6.0",
+  "gd": { "win": "2.2074", "android": "2.2074", "mac": "2.2074", "ios": "2.2074" },
+  "version": "v1.0.0",
+  "id": "user.layout-agent",
+  "name": "Layout Agent",
+  "developer": "user",
+  "description": "Genera layouts y decora selecciones en el editor con IA (Claude). Escribe en cualquier idioma.",
+  "settings": {
+    "api-key": { "type": "string", "name": "Anthropic API key", "default": "" },
+    "model": { "type": "string", "name": "Modelo", "default": "claude-sonnet-4-6" },
+    "max-objects": { "type": "int", "name": "Limite de objetos", "default": 500, "min": 50, "max": 2000 }
+  }
+}
