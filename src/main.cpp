@@ -1,7 +1,12 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/EditorUI.hpp>
 #include <Geode/utils/web.hpp>
+#include <Geode/utils/async.hpp>
+#include <cmath>
 #include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace geode::prelude;
 
@@ -11,7 +16,7 @@ static const std::set<int> ALLOWED = {
     35, 140, 67, 1332,                 // pads: amarillo, rosa, azul, rojo
     36, 141, 84, 1022, 1330, 1333,     // orbs: amarillo, rosa, azul, verde, negro, rojo
     10, 11, 12, 13, 47, 111, 660, 745, 1331, // portales gravedad/modos
-    99, 101,                           // mini / normal
+    99, 101,                           // normal / mini
     200, 201, 202, 203, 1334           // portales de velocidad
 };
 
@@ -22,7 +27,7 @@ A block centered on the ground has y=0.5. Center of the first column is x=0.5.
 Allowed IDs: 1 block, 8 spike, 39 small spike, 35 yellow pad, 140 pink pad, 67 blue pad, 1332 red pad,
 36 yellow orb, 141 pink orb, 84 blue orb, 1022 green orb, 1330 black orb, 1333 red orb,
 10 gravity down portal, 11 gravity up portal, 12 cube, 13 ship, 47 ball, 111 ufo, 660 wave, 745 robot, 1331 spider,
-99 mini portal, 101 normal-size portal, 200 0.5x speed, 201 1x, 202 2x, 203 3x, 1334 4x speed.
+99 normal-size portal, 101 mini portal, 200 0.5x speed, 201 1x, 202 2x, 203 3x, 1334 4x speed.
 rot is degrees (0, 90, 180, 270). Spikes point up at rot 0 and must sit on a block or the floor.
 Rules: every jump must be physically beatable at the given speed; leave a floor/ceiling for the active gamemode;
 use rhythm, variety, ramps made of stacked blocks, orb chains and drops when asked for a hard or modern layout.
@@ -32,17 +37,19 @@ MODE decorate: you receive SELECTED objects as [id,x,y,rot] in block units. Add 
 Never exceed the object limit given.)";
 
 static std::vector<Ref<GameObject>> s_lastBatch;
+static LevelEditorLayer* s_batchLayer = nullptr; // editor al que pertenece s_lastBatch
 
-class AgentPopup : public Popup<EditorUI*> {
+class AgentPopup : public Popup {
 protected:
     EditorUI* m_ui = nullptr;
     TextInput* m_input = nullptr;
     CCLabelBMFont* m_status = nullptr;
     ButtonSprite* m_modeSpr = nullptr;
     int m_mode = 0; // 0 layout, 1 decorar seleccion
-    EventListener<web::WebTask> m_listener;
+    async::TaskHolder<web::WebResponse> m_task;
 
-    bool setup(EditorUI* ui) override {
+    bool init(EditorUI* ui) {
+        if (!Popup::init(380.f, 220.f)) return false;
         m_ui = ui;
         this->setTitle("Layout Agent");
 
@@ -72,9 +79,6 @@ protected:
         menu->updateLayout();
         m_mainLayer->addChildAtPosition(menu, Anchor::Bottom, {0.f, 35.f});
 
-        m_listener.bind([this](web::WebTask::Event* e) {
-            if (auto* res = e->getValue()) this->onResponse(res);
-        });
         return true;
     }
 
@@ -82,9 +86,16 @@ protected:
 
     void onUndo() {
         auto layer = m_ui->m_editorLayer;
+        if (layer != s_batchLayer || s_lastBatch.empty()) {
+            s_lastBatch.clear();
+            s_batchLayer = nullptr;
+            return setStatus("Nada que deshacer");
+        }
+        auto count = s_lastBatch.size();
         for (auto& o : s_lastBatch) if (o) layer->removeObject(o, false);
-        setStatus(fmt::format("Quitados {} objetos", s_lastBatch.size()));
         s_lastBatch.clear();
+        s_batchLayer = nullptr;
+        setStatus(fmt::format("Quitados {} objetos", count));
     }
 
     void onGenerate() {
@@ -93,8 +104,9 @@ protected:
         auto model = Mod::get()->getSettingValue<std::string>("model");
         auto limit = Mod::get()->getSettingValue<int64_t>("max-objects");
 
+        std::string request(m_input->getString());
         std::string user = fmt::format("MODE {}\nObject limit: {}\nRequest: {}\n",
-            m_mode == 0 ? "layout" : "decorate", limit, m_input->getString());
+            m_mode == 0 ? "layout" : "decorate", limit, request);
 
         if (m_mode == 1) {
             auto sel = m_ui->getSelectedObjects();
@@ -106,42 +118,66 @@ protected:
                 list += fmt::format("[{},{:.1f},{:.1f},{}],", o->m_objectID,
                     o->getPositionX() / 30.f, o->getPositionY() / 30.f, (int)o->getRotation());
             }
+            if (!list.empty() && list.back() == ',') list.pop_back();
             list += "]\n";
             user += list;
         }
 
-        matjson::Value msg;
-        msg["role"] = "user";
-        msg["content"] = user;
+        matjson::Value msg = matjson::makeObject({
+            {"role", "user"},
+            {"content", user}
+        });
         matjson::Value msgs = std::vector<matjson::Value>{msg};
-        matjson::Value body;
-        body["model"] = model;
-        body["max_tokens"] = 16000;
-        body["system"] = std::string(SYSTEM_PROMPT);
-        body["messages"] = msgs;
+        matjson::Value body = matjson::makeObject({
+            {"model", model},
+            {"max_tokens", 16000},
+            {"system", std::string(SYSTEM_PROMPT)},
+            {"messages", msgs}
+        });
 
         web::WebRequest req;
         req.header("x-api-key", key);
         req.header("anthropic-version", "2023-06-01");
         req.timeout(std::chrono::seconds(180));
         req.bodyJSON(body);
-        m_listener.setFilter(req.post("https://api.anthropic.com/v1/messages"));
+
+        // Cerrar el popup cancela la peticion (TaskHolder se destruye con el popup).
+        m_task.spawn(
+            req.post("https://api.anthropic.com/v1/messages"),
+            [this](web::WebResponse res) { this->onResponse(std::move(res)); }
+        );
         setStatus("Pensando... (no cierres esta ventana)");
     }
 
-    void onResponse(web::WebResponse* res) {
-        if (!res->ok()) return setStatus(fmt::format("Error HTTP {}", res->code()));
-        auto j = res->json();
-        if (!j) return setStatus("Respuesta invalida");
-        auto root = j.unwrap();
-        std::string text = root["content"][0]["text"].asString().unwrapOr("");
+    void onResponse(web::WebResponse res) {
+        if (!res.ok()) {
+            log::error("Anthropic API error {}: {}", res.code(), res.string().unwrapOr(""));
+            return setStatus(fmt::format("Error HTTP {}", res.code()));
+        }
+        auto json = res.json();
+        if (json.isErr()) return setStatus("Respuesta invalida");
+        auto root = json.unwrap();
+
+        std::string text;
+        auto content = root["content"];
+        if (content.isArray()) {
+            for (size_t i = 0; i < content.size(); ++i) {
+                auto& block = content[i];
+                if (block["type"].asString().unwrapOr("") == "text") {
+                    text += block["text"].asString().unwrapOr("");
+                }
+            }
+        }
+
         auto a = text.find('{');
         auto b = text.rfind('}');
-        if (a == std::string::npos || b == std::string::npos) return setStatus("La IA no devolvio JSON");
+        if (a == std::string::npos || b == std::string::npos || b < a) {
+            return setStatus("La IA no devolvio JSON");
+        }
         auto parsed = matjson::parse(text.substr(a, b - a + 1));
-        if (!parsed) return setStatus("JSON roto, intenta de nuevo");
-        auto arr = parsed.unwrap()["objects"].asArray();
-        if (!arr) return setStatus("Sin objetos");
+        if (parsed.isErr()) return setStatus("JSON roto, intenta de nuevo");
+        auto objects = parsed.unwrap()["objects"];
+        if (!objects.isArray()) return setStatus("Sin objetos");
 
         auto layer = m_ui->m_editorLayer;
         auto ol = layer->m_objectLayer;
@@ -152,16 +188,16 @@ protected:
         }
         auto limit = Mod::get()->getSettingValue<int64_t>("max-objects");
         s_lastBatch.clear();
-        for (auto& o : arr.unwrap()) {
+        s_batchLayer = layer;
+        for (size_t i = 0; i < objects.size(); ++i) {
             if ((int64_t)s_lastBatch.size() >= limit) break;
-            if (!o.isArray()) continue;
-            auto const& v = o.asArray().unwrap();
-            if (v.size() < 3) continue;
-            int id = (int)v[0].asInt().unwrapOr(0);
+            auto& o = objects[i];
+            if (!o.isArray() || o.size() < 3) continue;
+            int id = (int)o[0].asInt().unwrapOr(0);
             if (!ALLOWED.count(id)) continue;
-            float gx = (float)v[1].asDouble().unwrapOr(0);
-            float gy = (float)v[2].asDouble().unwrapOr(0);
-            float rot = v.size() > 3 ? (float)v[3].asDouble().unwrapOr(0) : 0.f;
+            float gx = (float)o[1].asDouble().unwrapOr(0);
+            float gy = (float)o[2].asDouble().unwrapOr(0);
+            float rot = o.size() > 3 ? (float)o[3].asDouble().unwrapOr(0) : 0.f;
             auto obj = layer->createObject(id, CCPoint{ox + gx * 30.f, gy * 30.f}, false);
             if (!obj) continue;
             obj->setRotation(rot);
@@ -173,8 +209,11 @@ protected:
 public:
     static AgentPopup* create(EditorUI* ui) {
         auto ret = new AgentPopup();
-        if (ret->initAnchored(380.f, 220.f, ui)) { ret->autorelease(); return ret; }
-        CC_SAFE_DELETE(ret);
+        if (ret->init(ui)) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
         return nullptr;
     }
 };
@@ -183,10 +222,19 @@ class $modify(AgentEditorUI, EditorUI) {
     bool init(LevelEditorLayer* layer) {
         if (!EditorUI::init(layer)) return false;
         auto spr = ButtonSprite::create("IA", 40, true, "bigFont.fnt", "GJ_button_02.png", 30.f, 0.6f);
-        auto btn = CCMenuItemExt::createSpriteExtra(spr, [this](auto) { AgentPopup::create(this)->show(); });
+        auto btn = CCMenuItemExt::createSpriteExtra(spr, [this](auto) {
+            if (auto popup = AgentPopup::create(this)) popup->show();
+        });
         if (auto menu = this->getChildByID("undo-menu")) {
             menu->addChild(btn);
             menu->updateLayout();
+        } else {
+            // Sin Node IDs instalado el menu no existe: usamos uno propio para que el boton se vea.
+            auto win = CCDirector::get()->getWinSize();
+            auto fallback = CCMenu::create();
+            fallback->setPosition({win.width - 30.f, win.height - 90.f});
+            fallback->addChild(btn);
+            this->addChild(fallback, 100);
         }
         return true;
     }
